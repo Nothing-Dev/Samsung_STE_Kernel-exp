@@ -63,6 +63,72 @@ static DEFINE_MUTEX(list_mutex);
 
 static struct kobject *idletimer_tg_kobj;
 
+<<<<<<< HEAD
+=======
+static void notify_netlink(const char *iface, struct idletimer_tg *timer)
+{
+	struct sk_buff *log_skb;
+	size_t size;
+	struct nlmsghdr *nlh;
+	char str[NLMSG_MAX_SIZE];
+	int event_type, res;
+
+	size = NLMSG_SPACE(NLMSG_MAX_SIZE);
+	size = max(size, (size_t)NLMSG_GOODSIZE);
+	log_skb = alloc_skb(size, GFP_ATOMIC);
+	if (!log_skb) {
+		pr_err("xt_cannot alloc skb for logging\n");
+		return;
+	}
+
+	event_type = timer->active ? NL_EVENT_TYPE_ACTIVE
+				: NL_EVENT_TYPE_INACTIVE;
+	res = snprintf(str, NLMSG_MAX_SIZE, "%s %s\n", iface,
+		timer->active ? "ACTIVE" : "INACTIVE");
+	if (NLMSG_MAX_SIZE <= res)
+		goto nlmsg_failure;
+
+	/* NLMSG_PUT() uses "goto nlmsg_failure" */
+	nlh = NLMSG_PUT(log_skb, /*pid*/0, /*seq*/0, event_type,
+			/* Size of message */NLMSG_MAX_SIZE);
+
+	strncpy(NLMSG_DATA(nlh), str, MAX_IDLETIMER_LABEL_SIZE);
+
+	NETLINK_CB(log_skb).dst_group = 1;
+	netlink_broadcast(nl_sk, log_skb, 0, 1, GFP_ATOMIC);
+
+	pr_debug("putting nlmsg: %s", str);
+	return;
+
+nlmsg_failure:  /* Used within NLMSG_PUT() */
+	consume_skb(log_skb);
+	pr_debug("Failed nlmsg_put\n");
+}
+
+static void notify_netlink_uevent(const char *iface, struct idletimer_tg *timer)
+{
+	char iface_msg[NLMSG_MAX_SIZE];
+	char state_msg[NLMSG_MAX_SIZE];
+	char *envp[] = { iface_msg, state_msg, NULL };
+	int res;
+
+	res = snprintf(iface_msg, NLMSG_MAX_SIZE, "INTERFACE=%s",
+		       iface);
+	if (NLMSG_MAX_SIZE <= res) {
+		pr_err("message too long (%d)", res);
+		return;
+	}
+	res = snprintf(state_msg, NLMSG_MAX_SIZE, "STATE=%s",
+		       timer->active ? "active" : "inactive");
+	if (NLMSG_MAX_SIZE <= res) {
+		pr_err("message too long (%d)", res);
+		return;
+	}
+	pr_debug("putting nlmsg: <%s> <%s>\n", iface_msg, state_msg);
+	kobject_uevent_env(idletimer_tg_kobj, KOBJ_CHANGE, envp);
+	return;
+}
+
 static
 struct idletimer_tg *__idletimer_tg_find_by_label(const char *label)
 {
@@ -105,6 +171,9 @@ static void idletimer_tg_work(struct work_struct *work)
 						  work);
 
 	sysfs_notify(idletimer_tg_kobj, NULL, timer->attr.attr.name);
+
+	if (timer->send_nl_msg)
+		notify_netlink_uevent(timer->attr.attr.name, timer);
 }
 
 static void idletimer_tg_expired(unsigned long data)
