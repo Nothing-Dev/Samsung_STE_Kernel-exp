@@ -5,6 +5,7 @@
  * After timer expires a kevent will be sent.
  *
  * Copyright (C) 2004, 2010 Nokia Corporation
+ *
  * Written by Timo Teras <ext-timo.teras@nokia.com>
  *
  * Converted to x_tables and reworked for upstream inclusion
@@ -38,6 +39,7 @@
 #include <linux/netfilter/xt_IDLETIMER.h>
 #include <linux/kdev_t.h>
 #include <linux/kobject.h>
+#include <linux/skbuff.h>
 #include <linux/workqueue.h>
 #include <linux/sysfs.h>
 #include <linux/rtc.h>
@@ -46,8 +48,6 @@
 #include <linux/suspend.h>
 #include <linux/notifier.h>
 #include <net/net_namespace.h>
-
-static struct sock *nl_sk;
 
 struct idletimer_tg_attr {
 	struct attribute attr;
@@ -80,46 +80,6 @@ static DEFINE_MUTEX(list_mutex);
 static DEFINE_SPINLOCK(timestamp_lock);
 
 static struct kobject *idletimer_tg_kobj;
-
-static void notify_netlink(const char *iface, struct idletimer_tg *timer)
-{
-	struct sk_buff *log_skb;
-	size_t size;
-	struct nlmsghdr *nlh;
-	char str[NLMSG_MAX_SIZE];
-	int event_type, res;
-
-	size = NLMSG_SPACE(NLMSG_MAX_SIZE);
-	size = max(size, (size_t)NLMSG_GOODSIZE);
-	log_skb = alloc_skb(size, GFP_ATOMIC);
-	if (!log_skb) {
-		pr_err("xt_cannot alloc skb for logging\n");
-		return;
-	}
-
-	event_type = timer->active ? NL_EVENT_TYPE_ACTIVE
-				: NL_EVENT_TYPE_INACTIVE;
-	res = snprintf(str, NLMSG_MAX_SIZE, "%s %s\n", iface,
-		timer->active ? "ACTIVE" : "INACTIVE");
-	if (NLMSG_MAX_SIZE <= res)
-		goto nlmsg_failure;
-
-	/* NLMSG_PUT() uses "goto nlmsg_failure" */
-	nlh = NLMSG_PUT(log_skb, /*pid*/0, /*seq*/0, event_type,
-			/* Size of message */NLMSG_MAX_SIZE);
-
-	strncpy(NLMSG_DATA(nlh), str, MAX_IDLETIMER_LABEL_SIZE);
-
-	NETLINK_CB(log_skb).dst_group = 1;
-	netlink_broadcast(nl_sk, log_skb, 0, 1, GFP_ATOMIC);
-
-	pr_debug("putting nlmsg: %s", str);
-	return;
-
-nlmsg_failure:  /* Used within NLMSG_PUT() */
-	consume_skb(log_skb);
-	pr_debug("Failed nlmsg_put\n");
-}
 
 static bool check_for_delayed_trigger(struct idletimer_tg *timer,
 		struct timespec *ts)
@@ -190,6 +150,8 @@ static void notify_netlink_uevent(const char *iface, struct idletimer_tg *timer)
 	pr_debug("putting nlmsg: <%s> <%s>\n", iface_msg, state_msg);
 	kobject_uevent_env(idletimer_tg_kobj, KOBJ_CHANGE, envp);
 	return;
+
+
 }
 
 static
@@ -212,6 +174,7 @@ static ssize_t idletimer_tg_show(struct kobject *kobj, struct attribute *attr,
 {
 	struct idletimer_tg *timer;
 	unsigned long expires = 0;
+	unsigned long now = jiffies;
 
 	mutex_lock(&list_mutex);
 
@@ -221,11 +184,15 @@ static ssize_t idletimer_tg_show(struct kobject *kobj, struct attribute *attr,
 
 	mutex_unlock(&list_mutex);
 
-	if (time_after(expires, jiffies))
+	if (time_after(expires, now))
 		return sprintf(buf, "%u\n",
-			       jiffies_to_msecs(expires - jiffies) / 1000);
+			       jiffies_to_msecs(expires - now) / 1000);
 
-	return sprintf(buf, "0\n");
+	if (timer->send_nl_msg)
+		return sprintf(buf, "0 %d\n",
+			jiffies_to_msecs(now - expires) / 1000);
+	else
+		return sprintf(buf, "0\n");
 }
 
 static void idletimer_tg_work(struct work_struct *work)
@@ -391,16 +358,13 @@ static unsigned int idletimer_tg_target(struct sk_buff *skb,
 					 const struct xt_action_param *par)
 {
 	const struct idletimer_tg_info *info = par->targinfo;
+	unsigned long now = jiffies;
 
 	pr_debug("resetting timer %s, timeout period %u\n",
 		 info->label, info->timeout);
 
 	BUG_ON(!info->timer);
 
-	mod_timer(&info->timer->timer,
-		  msecs_to_jiffies(info->timeout * 1000) + jiffies);
-
-=======
 	info->timer->active = true;
 
 	if (time_before(info->timer->timer.expires, now)) {
@@ -411,7 +375,6 @@ static unsigned int idletimer_tg_target(struct sk_buff *skb,
 
 	/* TODO: Avoid modifying timers on each packet */
 	reset_timer(info);
->>>>>>> 0c208e6... nf: IDLETIMER: time-stamp and suspend/resume handling.
 	return XT_CONTINUE;
 }
 
@@ -420,7 +383,7 @@ static int idletimer_tg_checkentry(const struct xt_tgchk_param *par)
 	struct idletimer_tg_info *info = par->targinfo;
 	int ret;
 
-	pr_debug("checkentry targinfo%s\n", info->label);
+	pr_debug("checkentry targinfo %s\n", info->label);
 
 	if (info->timeout == 0) {
 		pr_debug("timeout value is zero\n");
@@ -439,8 +402,6 @@ static int idletimer_tg_checkentry(const struct xt_tgchk_param *par)
 	info->timer = __idletimer_tg_find_by_label(info->label);
 	if (info->timer) {
 		info->timer->refcnt++;
-		mod_timer(&info->timer->timer,
-			  msecs_to_jiffies(info->timeout * 1000) + jiffies);
 
 		reset_timer(info);
 		pr_debug("increased refcnt of timer %s to %u\n",
@@ -455,6 +416,7 @@ static int idletimer_tg_checkentry(const struct xt_tgchk_param *par)
 	}
 
 	mutex_unlock(&list_mutex);
+
 	return 0;
 }
 
@@ -477,7 +439,7 @@ static void idletimer_tg_destroy(const struct xt_tgdtor_param *par)
 		kfree(info->timer);
 	} else {
 		pr_debug("decreased refcnt of timer %s to %u\n",
-			 info->label, info->timer->refcnt);
+		info->label, info->timer->refcnt);
 	}
 
 	mutex_unlock(&list_mutex);
@@ -485,6 +447,7 @@ static void idletimer_tg_destroy(const struct xt_tgdtor_param *par)
 
 static struct xt_target idletimer_tg __read_mostly = {
 	.name		= "IDLETIMER",
+	.revision	= 1,
 	.family		= NFPROTO_UNSPEC,
 	.target		= idletimer_tg_target,
 	.targetsize     = sizeof(struct idletimer_tg_info),
@@ -550,3 +513,4 @@ MODULE_DESCRIPTION("Xtables: idle time monitor");
 MODULE_LICENSE("GPL v2");
 MODULE_ALIAS("ipt_IDLETIMER");
 MODULE_ALIAS("ip6t_IDLETIMER");
+MODULE_ALIAS("arpt_IDLETIMER");
