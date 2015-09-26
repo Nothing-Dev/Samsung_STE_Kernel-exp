@@ -81,6 +81,7 @@
 #ifdef CONFIG_MACH_SEC_KYLE
 #undef USE_CID_CHECK
 #define READ_MACADDR
+#define WRITE_MACADDR
 #endif
 
 #ifdef CONFIG_MACH_JANICE
